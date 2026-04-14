@@ -171,7 +171,7 @@ The initial port focused on the conformance tests, which couldn't test many deta
 #### For going through function library refactoring
 
 > Alright, now it's time to implement Phase 2 of our function library plan. Keep track of items in the checklist of the spec:
-> 
+>
 > 1. Determine what to do, and make sure you understand it well. Mark the item as in-progress.
 > 2. Implement the item, making sure the quality is high, including tests.
 > 3. Update the item's status.
@@ -343,7 +343,7 @@ We also spent time reviewing the implementation code directly to validate that t
 > 7. The code should compile cleanly, no errors or warnings. You should run the tests and confirm they all pass.
 > 8. Run additional experiments to find flaws in the library, for example if you suspect there is undefined behavior, a potential crash, or a logic bug, proceed to write failing tests that demonstrate the behavior for review in the report.
 >
-> Write all your results into a report at ~/openjd-rs/specs/<crate-name>-quality-evaluation-report.md. Include itemized details of all the parts you looked at, as well as a section containing your recommendations for improving the crate. Only use the deadline-openjd subagent, never use a different one.
+> Write all your results into a report at ~/openjd-rs/reports/<crate-name>-quality-evaluation-report.md. Include itemized details of all the parts you looked at, as well as a section containing your recommendations for improving the crate. Only use the deadline-openjd subagent, never use a different one.
 
 ## Example output of one of these prompts
 
@@ -354,7 +354,7 @@ This is the example start of the output from the above prompt for the model libr
 > The openjd-model crate is a well-engineered Rust implementation of the Open Job Description 2023-09 template specification. The specifications are thorough and well-organized. The implementation closely follows both the spec and the Python reference implementation. The test suite is comprehensive with 1,516 tests covering happy paths, edge cases, and error message formatting.
 >
 > Two confirmed bugs were found through exploratory testing:
-> 
+>
 > 1. HashMap ordering nondeterminism in default parameter space iteration (correctness bug)
 > 2. Description byte-length vs character-count validation (spec conformance bug)
 >

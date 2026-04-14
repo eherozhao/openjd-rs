@@ -1,1 +1,6 @@
+# Require approval from Developers team by default
 * @OpenJobDescription/Developers
+
+# Reports are generated and for review purposes, so
+# require less review to get merged.
+/reports/*
