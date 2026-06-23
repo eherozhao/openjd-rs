@@ -19,14 +19,34 @@ pub enum CopyResult {
     NotSupported,
 }
 
-/// Maximum number of parts allowed in an S3 multipart upload.
+// S3 service limits used to size and bound server-side multipart copies.
+//
+// These are Amazon S3 API limits, not arbitrary tuning knobs. AWS may change
+// them over time, so they are pinned here with links to the authoritative
+// public docs for review and future maintenance:
+//
+// - Multipart upload limits (max parts, min/max part size):
+//   https://docs.aws.amazon.com/AmazonS3/latest/userguide/qfacts.html
+// - CopyObject (single-call 5 GiB source limit):
+//   https://docs.aws.amazon.com/AmazonS3/latest/API/API_CopyObject.html
+// - UploadPartCopy (per-part byte-range copy):
+//   https://docs.aws.amazon.com/AmazonS3/latest/API/API_UploadPartCopy.html
+
+/// Maximum number of parts allowed in an S3 multipart upload (S3 limit: 10,000).
+/// See <https://docs.aws.amazon.com/AmazonS3/latest/userguide/qfacts.html>.
 const S3_MAX_MULTIPART_PARTS: u64 = 10_000;
-/// Maximum size (in bytes) of a copy source for a single `CopyObject` call (5 GiB).
-/// Sources larger than this must be copied with multipart `UploadPartCopy`.
+/// Maximum size (in bytes) of a copy source for a single `CopyObject` call
+/// (S3 limit: 5 GiB). Sources larger than this must be copied with multipart
+/// `UploadPartCopy`. See
+/// <https://docs.aws.amazon.com/AmazonS3/latest/API/API_CopyObject.html>.
 pub const S3_MAX_SINGLE_COPY_BYTES: u64 = 5 * 1024 * 1024 * 1024;
-/// S3 minimum multipart part size (5 MiB). Applies to every part except the last.
+/// S3 minimum multipart part size (S3 limit: 5 MiB). Applies to every part
+/// except the last. See
+/// <https://docs.aws.amazon.com/AmazonS3/latest/userguide/qfacts.html>.
 const S3_MIN_PART_SIZE: u64 = 5 * 1024 * 1024;
-/// S3 maximum size of a single part / `UploadPartCopy` byte range (5 GiB).
+/// S3 maximum size of a single part / `UploadPartCopy` byte range
+/// (S3 limit: 5 GiB). See
+/// <https://docs.aws.amazon.com/AmazonS3/latest/userguide/qfacts.html>.
 const S3_MAX_PART_SIZE: u64 = 5 * 1024 * 1024 * 1024;
 /// Default multipart-copy threshold (5 MiB). This is a *performance*
 /// threshold, not S3's API cap: cross-region single `CopyObject` runs at
@@ -718,9 +738,14 @@ impl S3DataCache {
     ) -> std::io::Result<()> {
         use futures_util::stream::StreamExt;
 
+        // Pick a part size for this object: the configured size, grown if
+        // needed so the part count stays within S3's 10,000-part cap, then
+        // split the byte range into that many parts.
         let part_size = cfg.effective_part_size(size);
         let num_parts = size.div_ceil(part_size);
 
+        // Open the multipart upload on the destination. All parts copied below
+        // attach to the returned upload_id; it must be completed or aborted.
         let create = self
             .client
             .create_multipart_upload()
@@ -740,6 +765,9 @@ impl S3DataCache {
             .ok_or_else(|| std::io::Error::other("CreateMultipartUpload missing upload_id"))?;
         let upload_id = upload_id.as_str();
 
+        // Precompute the (1-based part number, inclusive byte range) for each
+        // part. The last part is short unless `size` is an exact multiple of
+        // `part_size`.
         let part_ranges: Vec<(i32, u64, u64)> = (0..num_parts)
             .map(|i| {
                 let part_number = (i + 1) as i32;
@@ -749,6 +777,10 @@ impl S3DataCache {
             })
             .collect();
 
+        // Copy every part server-side with UploadPartCopy, up to
+        // `max_concurrency` requests in flight at once. No object bytes pass
+        // through the client. Each part returns its (part number, ETag), which
+        // CompleteMultipartUpload needs to stitch the object back together.
         let copy_results: Vec<std::io::Result<(i32, String)>> =
             futures_util::stream::iter(part_ranges)
                 .map(|(part_number, start, end)| async move {
@@ -762,6 +794,8 @@ impl S3DataCache {
                         .part_number(part_number)
                         .copy_source(copy_source)
                         .copy_source_range(&range)
+                        // Destination and source bucket-owner guards
+                        // (confused-deputy protection).
                         .set_expected_bucket_owner(self.expected_bucket_owner.clone())
                         .set_expected_source_bucket_owner(src_s3.expected_bucket_owner.clone())
                         .send()
@@ -786,6 +820,9 @@ impl S3DataCache {
                 .collect()
                 .await;
 
+        // Separate successful parts from the first error. We drain the whole
+        // stream first (rather than short-circuiting) so there are no parts
+        // still in flight when we decide whether to complete or abort.
         let mut parts = Vec::with_capacity(num_parts as usize);
         let mut first_err = None;
         for r in copy_results {
@@ -799,6 +836,9 @@ impl S3DataCache {
             }
         }
 
+        // On any failure, abort the upload so S3 doesn't retain the
+        // in-progress parts (which would otherwise accrue storage charges),
+        // then surface the first error.
         if let Some(e) = first_err {
             let _ = self
                 .client
@@ -812,6 +852,9 @@ impl S3DataCache {
             return Err(e);
         }
 
+        // All parts succeeded. S3 requires the parts in ascending part-number
+        // order (they completed out of order due to buffer_unordered), each
+        // with its ETag, to finalize and assemble the destination object.
         parts.sort_by_key(|(num, _)| *num);
         let completed_parts: Vec<_> = parts
             .into_iter()
