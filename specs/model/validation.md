@@ -27,7 +27,7 @@ applicable passes, and return accumulated errors as `ModelError::ModelValidation
 
 ## Pass Architecture
 
-The validation pipeline is passes 5–9 of the overall decode pipeline (passes 1–4 are in
+The validation pipeline is passes 5–10 of the overall decode pipeline (passes 1–4 are in
 the `parse` module — see [parsing.md](parsing.md)). Passes run sequentially. Each pass
 receives the template and the computed limits/rules, and appends errors to a shared
 `ValidationErrors` collector. All passes run regardless of earlier errors (no
@@ -40,6 +40,7 @@ short-circuiting), so users see all problems at once.
 | 7 | `feature_bundle_1.rs` | Gate FEATURE_BUNDLE_1 features (simple actions, endOfLine) |
 | 8 | `format_strings.rs` | Validate format string variable references; adapts scopes and expression complexity based on EXPR |
 | 9 | `task_chunking.rs` | Gate TASK_CHUNKING features (ChunkInt parameters) |
+| 10 | `wrap_actions.rs` | Gate WRAP_ACTIONS features (onWrapEnvEnter, onWrapTaskRun, onWrapEnvExit) and enforce the single-wrap-layer-per-session rule (RFC 0008) |
 
 ## Pass 5: Limits Enforcement
 
@@ -169,6 +170,30 @@ Validates or rejects features gated behind `TASK_CHUNKING`:
 - Only one `ChunkInt` parameter per step
 - `ChunkInt` parameter must not appear inside parentheses in the combination expression
   (must not be in an associative combination)
+
+## Pass 10: WRAP_ACTIONS Gating
+
+Validates or rejects features gated behind `WRAP_ACTIONS` (RFC 0008):
+
+- **Wrap hooks** (`onWrapEnvEnter`, `onWrapTaskRun`, `onWrapEnvExit`): Rejected on any
+  environment when the extension is not declared.
+- **EXPR prerequisite**: `WRAP_ACTIONS` requires `EXPR` to also be declared (the wrap
+  mechanism forwards inner-action bytes through the EXPR function library). Declaring
+  `WRAP_ACTIONS` without `EXPR` is an error.
+- **All-or-nothing rule**: an environment that defines any one wrap hook must define all
+  three. Defining a partial set is an error.
+- **Single-wrap-layer rule**: at most one environment reachable in a session may define
+  wrap hooks. A session's environment stack is the job's `jobEnvironments` plus exactly
+  one step's `stepEnvironments`, so this is enforced per step: for every step, the count
+  of wrap-defining envs in `jobEnvironments` plus that step's `stepEnvironments` must be
+  ≤ 1. Multiple wrap envs in `jobEnvironments` alone are reported once at the
+  `jobEnvironments` path (reachable from every session); a step that adds its own wrap env
+  on top is reported at that step's `stepEnvironments` path.
+
+The single-layer rule runs only in the job-template path. An environment template defines
+one environment, so the rule is trivially satisfied for an isolated env template; if
+separately-validated env templates are composed into a session at assembly time
+(worker-side), the cross-layer constraint must be enforced there.
 
 ## Error Infrastructure
 

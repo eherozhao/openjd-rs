@@ -7,6 +7,7 @@
 
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::LazyLock;
 
 fn openjd_bin() -> PathBuf {
     // Use cargo to find the binary
@@ -22,12 +23,137 @@ fn templates_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/templates")
 }
 
+/// Resolve a shim directory to prepend to `PATH` so every template's
+/// `command: python` works regardless of what the host happens to
+/// provide. The resolution order is:
+///
+/// 1. If `OPENJD_TEST_PYTHON` is set in the environment, use it as the
+///    target interpreter. This lets CI or developers override the
+///    interpreter explicitly (e.g. a specific venv's python).
+/// 2. Otherwise, check the host `PATH` for the first of `python`,
+///    `python3`, `python3.13`, `python3.12`, `python3.11`, `python3.10`,
+///    `python3.9` that exists as an executable. The probe order favors
+///    the canonical name `python` first so no shim is created when the
+///    host already provides it.
+///
+/// If a shim is needed, a persistent temp directory is created (leaked
+/// via `Box::leak` — tests run once per process, the OS reclaims the
+/// dir when the process exits) and a `python` symlink or wrapper script
+/// is placed inside pointing at the resolved interpreter. Returns
+/// `None` when `python` is already directly available on `PATH` so the
+/// caller can short-circuit.
+///
+/// This keeps the YAML fixtures portable (`command: python`) while
+/// surviving hosts that only install `python3`.
+fn python_shim_dir() -> Option<PathBuf> {
+    static SHIM: LazyLock<Option<PathBuf>> = LazyLock::new(|| {
+        // Fail fast with a clear message: a Python interpreter is required for
+        // the CLI tests, so a failure to find one should not be silently
+        // swallowed into a confusing downstream test failure.
+        let target = resolve_python_interpreter().expect("Failed to find a Python interpreter");
+        // If the interpreter is literally named `python` we don't need a shim —
+        // its parent directory is already on `PATH` (that's how `which` found
+        // it, transitively). Detect this by comparing the file-name component.
+        if target.file_name().and_then(|n| n.to_str()) == Some("python") {
+            return None;
+        }
+        let shim_dir =
+            std::env::temp_dir().join(format!("openjd-cli-tests-python-{}", std::process::id()));
+        // A shim was needed but we failed to set it up — fail fast with a
+        // descriptive message rather than returning `None`, which would make
+        // the downstream test fail in a way that's hard to diagnose.
+        std::fs::create_dir_all(&shim_dir)
+            .unwrap_or_else(|e| panic!("Failed to create shim_dir {shim_dir:?}: {e}"));
+        let shim_path = shim_dir.join(if cfg!(windows) {
+            "python.cmd"
+        } else {
+            "python"
+        });
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // Write a small shell script rather than a symlink — a symlink to
+            // `python3` breaks when that binary itself inspects `argv[0]` to
+            // decide behavior (rare, but some venv wrappers do this).
+            let script = format!("#!/bin/sh\nexec {:?} \"$@\"\n", target);
+            std::fs::write(&shim_path, script)
+                .unwrap_or_else(|e| panic!("Failed to write python shim {shim_path:?}: {e}"));
+            let mut perms = std::fs::metadata(&shim_path)
+                .unwrap_or_else(|e| panic!("Failed to stat python shim {shim_path:?}: {e}"))
+                .permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&shim_path, perms).unwrap_or_else(|e| {
+                panic!("Failed to set permissions on python shim {shim_path:?}: {e}")
+            });
+        }
+        #[cfg(windows)]
+        {
+            // On Windows a .cmd wrapper works for anything spawned via
+            // CreateProcess with a bare name lookup.
+            let script = format!("@echo off\r\n{} %*\r\n", target.display());
+            std::fs::write(&shim_path, script)
+                .unwrap_or_else(|e| panic!("Failed to write python shim {shim_path:?}: {e}"));
+        }
+        Some(shim_dir)
+    });
+    SHIM.clone()
+}
+
+/// Locate a usable Python interpreter on the host `PATH`, or return the
+/// value of `OPENJD_TEST_PYTHON` if set. Returns `None` if none of the
+/// candidate names exists — the caller should let the underlying test
+/// fail with a clear message in that case.
+fn resolve_python_interpreter() -> Option<PathBuf> {
+    if let Ok(explicit) = std::env::var("OPENJD_TEST_PYTHON") {
+        let p = PathBuf::from(explicit);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    // Candidate names in priority order. `python` first so we early-exit
+    // without creating a shim on hosts that already provide it.
+    let candidates: &[&str] = &[
+        "python",
+        "python3",
+        "python3.13",
+        "python3.12",
+        "python3.11",
+        "python3.10",
+        "python3.9",
+    ];
+    let path_var = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path_var) {
+        for name in candidates {
+            let exe = if cfg!(windows) {
+                dir.join(format!("{name}.exe"))
+            } else {
+                dir.join(name)
+            };
+            if exe.is_file() {
+                return Some(exe);
+            }
+        }
+    }
+    None
+}
+
 fn run_cli(args: &[&str]) -> (i32, String, String) {
-    let output = Command::new(openjd_bin())
-        .args(args)
-        .env("RUSTUP_TOOLCHAIN", "1.94.1")
-        .output()
-        .expect("failed to execute openjd");
+    let mut cmd = Command::new(openjd_bin());
+    cmd.args(args).env("RUSTUP_TOOLCHAIN", "1.94.1");
+    if let Some(shim) = python_shim_dir() {
+        // Only rewrite PATH when it's actually defined. If PATH is unset
+        // (extremely rare), skip — prepending the shim to an empty PATH would
+        // add an empty entry that searches the current directory for
+        // executables, which we don't want.
+        if let Some(existing) = std::env::var_os("PATH") {
+            let joined =
+                std::env::join_paths(std::iter::once(shim).chain(std::env::split_paths(&existing)))
+                    .expect("join_paths");
+            cmd.env("PATH", joined);
+        }
+    }
+    let output = cmd.output().expect("failed to execute openjd");
     let exit_code = output.status.code().unwrap_or(-1);
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
